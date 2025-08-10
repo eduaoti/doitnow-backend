@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.vscode
+ssl
+Dockerfile
+docker-compose.yml
+# dejamos uploads fuera de la imagen (se montará como volumen)
+uploads
