@@ -112,5 +112,6 @@ jobs:
           az container show -g "$RG" -n "$CONTAINER_NAME" \
             --query "{FQDN:ipAddress.fqdn,State:instanceView.state,Ports:ipAddress.ports}" -o table
 
+
       - name: Logs (opcional)
         run: az container logs -g "$RG" -n "$CONTAINER_NAME" || true
