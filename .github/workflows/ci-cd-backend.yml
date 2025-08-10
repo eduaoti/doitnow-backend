@@ -25,10 +25,10 @@ jobs:
 
     env:
       # ===== Azure / ACR =====
-      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}   # ej: eduaotiacr.azurecr.io
-      ACR_NAME:         ${{ secrets.ACR_NAME }}           # ej: eduaotiacr
-      RG:               ${{ secrets.AZURE_RESOURCE_GROUP }}   # ej: doitnow-rg
-      LOCATION:         ${{ secrets.AZURE_LOCATION }}         # ej: eastus
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}     # ej: eduaotiacr.azurecr.io
+      ACR_NAME:         ${{ secrets.ACR_NAME }}             # ej: eduaotiacr
+      RG:               ${{ secrets.AZURE_RESOURCE_GROUP }} # ej: doitnow-rg
+      LOCATION:         ${{ secrets.AZURE_LOCATION }}       # ej: eastus
 
       # ===== Imagen =====
       IMAGE_NAME: doitnow-backend
@@ -36,9 +36,9 @@ jobs:
 
       # ===== Contenedor (ACI) =====
       CONTAINER_NAME: doitnow-backend
-      DNS_LABEL:     doitnow-back-eduaoti   # cámbialo si ya existe en tu región
+      DNS_LABEL:     doitnow-back-eduaoti   # cambia si ya existe en tu región
 
-      # ===== Vars de la app (vienen de Secrets) =====
+      # ===== Vars de la app (desde Secrets) =====
       MONGO_URI:  ${{ secrets.MONGO_URI }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       MAIL_USER:  ${{ secrets.MAIL_USER }}
@@ -66,18 +66,25 @@ jobs:
           docker build --platform linux/amd64 -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG .
           docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
 
-      # ===== (Opcional) Docker Hub =====
-      - name: Docker Hub login
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-
-      - name: Push a Docker Hub
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+      # ===== (Opcional) Docker Hub: se salta si no hay secrets =====
+      - name: Docker Hub login (skip si no hay secrets)
         run: |
-          docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:$IMAGE_TAG
-          docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:latest
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:$IMAGE_TAG
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:latest
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          else
+            echo "No DOCKERHUB_USERNAME/DOCKERHUB_TOKEN; skipping Docker Hub login."
+          fi
+
+      - name: Push a Docker Hub (skip si no hay secrets)
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:$IMAGE_TAG
+            docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:latest
+            docker push ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:$IMAGE_TAG
+            docker push ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:latest
+          else
+            echo "No Docker Hub secrets; skipping push."
+          fi
 
       - name: Deploy to Azure Container Instances
         run: |
@@ -111,7 +118,6 @@ jobs:
         run: |
           az container show -g "$RG" -n "$CONTAINER_NAME" \
             --query "{FQDN:ipAddress.fqdn,State:instanceView.state,Ports:ipAddress.ports}" -o table
-
 
       - name: Logs (opcional)
         run: az container logs -g "$RG" -n "$CONTAINER_NAME" || true
