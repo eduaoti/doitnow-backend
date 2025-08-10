@@ -25,27 +25,27 @@ jobs:
 
     env:
       # ===== Azure / ACR =====
-      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}     # ej: eduaotiacr.azurecr.io
-      ACR_NAME:         ${{ secrets.ACR_NAME }}             # ej: eduaotiacr
-      RG:               ${{ secrets.AZURE_RESOURCE_GROUP }} # ej: doitnow-rg
-      LOCATION:         ${{ secrets.AZURE_LOCATION }}       # ej: eastus
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      ACR_NAME:         ${{ secrets.ACR_NAME }}
+      RG:               ${{ secrets.AZURE_RESOURCE_GROUP }}
+      LOCATION:         ${{ secrets.AZURE_LOCATION }}
 
-      # ===== Imagen =====
-      IMAGE_NAME: doitnow-backend          # (puede quedarse así)
+      # ===== Imagen (ahora doinow) =====
+      IMAGE_NAME: doinow-backend
       IMAGE_TAG:  ${{ github.sha }}
 
       # ===== Contenedor (ACI) =====
-      CONTAINER_NAME: doinow-backend       # <— nombre corregido del contenedor
-      DNS_LABEL:     doinow-back-eduaoti   # <— label a juego; debe ser único en la región
+      CONTAINER_NAME: doinow-backend
+      DNS_LABEL:     doinow-back-eduaoti   # cambialo si ya existe
 
-      # ===== Vars de la app (desde Secrets) =====
+      # ===== Vars de la app =====
       MONGO_URI:  ${{ secrets.MONGO_URI }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       MAIL_USER:  ${{ secrets.MAIL_USER }}
       MAIL_PASS:  ${{ secrets.MAIL_PASS }}
-      # CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
-      # CLOUDINARY_API_KEY:    ${{ secrets.CLOUDINARY_API_KEY }}
-      # CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+
+      # ===== Docker Hub =====
+      DOCKERHUB_REPO: doinow-backend   # <- nombre del repo en Docker Hub
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +66,7 @@ jobs:
           docker build --platform linux/amd64 -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG .
           docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
 
-      # ===== (Opcional) Docker Hub: se salta si no hay secrets =====
+      # ===== Docker Hub: se salta si no hay secrets =====
       - name: Docker Hub login (skip si no hay secrets)
         run: |
           if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
@@ -78,10 +78,11 @@ jobs:
       - name: Push a Docker Hub (skip si no hay secrets)
         run: |
           if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:$IMAGE_TAG
-            docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:latest
-            docker push ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:$IMAGE_TAG
-            docker push ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:latest
+            DH_REPO="${{ secrets.DOCKERHUB_USERNAME }}/${DOCKERHUB_REPO}"
+            docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG $DH_REPO:$IMAGE_TAG
+            docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG $DH_REPO:latest
+            docker push $DH_REPO:$IMAGE_TAG
+            docker push $DH_REPO:latest
           else
             echo "No Docker Hub secrets; skipping push."
           fi
@@ -91,7 +92,6 @@ jobs:
           CN="${CONTAINER_NAME}"
           DL="${DNS_LABEL}"
 
-          # Borra contenedor previo con el nombre nuevo (si existe)
           az container delete -g "$RG" -n "$CN" -y || true
 
           az container create \
