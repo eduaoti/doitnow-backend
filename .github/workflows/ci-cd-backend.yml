@@ -31,12 +31,12 @@ jobs:
       LOCATION:         ${{ secrets.AZURE_LOCATION }}       # ej: eastus
 
       # ===== Imagen =====
-      IMAGE_NAME: doitnow-backend
+      IMAGE_NAME: doitnow-backend          # (puede quedarse así)
       IMAGE_TAG:  ${{ github.sha }}
 
       # ===== Contenedor (ACI) =====
-      CONTAINER_NAME: doitnow-backend
-      DNS_LABEL:     doitnow-back-eduaoti   # cambia si ya existe en tu región
+      CONTAINER_NAME: doinow-backend       # <— nombre corregido del contenedor
+      DNS_LABEL:     doinow-back-eduaoti   # <— label a juego; debe ser único en la región
 
       # ===== Vars de la app (desde Secrets) =====
       MONGO_URI:  ${{ secrets.MONGO_URI }}
@@ -91,7 +91,7 @@ jobs:
           CN="${CONTAINER_NAME}"
           DL="${DNS_LABEL}"
 
-          # Borra el anterior si existe
+          # Borra contenedor previo con el nombre nuevo (si existe)
           az container delete -g "$RG" -n "$CN" -y || true
 
           az container create \
