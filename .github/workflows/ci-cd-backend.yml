@@ -1,0 +1,116 @@
+name: CI/CD - Backend (Tests, Build, Deploy)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    name: Ejecutar pruebas backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test --if-present
+
+  deploy:
+    name: Desplegar backend en Azure
+    needs: test
+    runs-on: ubuntu-latest
+
+    env:
+      # ===== Azure / ACR =====
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}   # ej: eduaotiacr.azurecr.io
+      ACR_NAME:         ${{ secrets.ACR_NAME }}           # ej: eduaotiacr
+      RG:               ${{ secrets.AZURE_RESOURCE_GROUP }}   # ej: doitnow-rg
+      LOCATION:         ${{ secrets.AZURE_LOCATION }}         # ej: eastus
+
+      # ===== Imagen =====
+      IMAGE_NAME: doitnow-backend
+      IMAGE_TAG:  ${{ github.sha }}
+
+      # ===== Contenedor (ACI) =====
+      CONTAINER_NAME: doitnow-backend
+      DNS_LABEL:     doitnow-back-eduaoti   # cámbialo si ya existe en tu región
+
+      # ===== Vars de la app (vienen de Secrets) =====
+      MONGO_URI:  ${{ secrets.MONGO_URI }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      MAIL_USER:  ${{ secrets.MAIL_USER }}
+      MAIL_PASS:  ${{ secrets.MAIL_PASS }}
+      # CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+      # CLOUDINARY_API_KEY:    ${{ secrets.CLOUDINARY_API_KEY }}
+      # CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure CLI Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Validar sesión
+        run: az account show
+
+      - name: Login a ACR (RBAC)
+        run: az acr login -n "$ACR_NAME"
+
+      - name: Build & Push Backend (ACR)
+        run: |
+          docker build --platform linux/amd64 -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG .
+          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
+
+      # ===== (Opcional) Docker Hub =====
+      - name: Docker Hub login
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Push a Docker Hub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:$IMAGE_TAG
+          docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:$IMAGE_TAG
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/$IMAGE_NAME:latest
+
+      - name: Deploy to Azure Container Instances
+        run: |
+          CN="${CONTAINER_NAME}"
+          DL="${DNS_LABEL}"
+
+          # Borra el anterior si existe
+          az container delete -g "$RG" -n "$CN" -y || true
+
+          az container create \
+            --resource-group "$RG" \
+            --name "$CN" \
+            --image "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
+            --dns-name-label "$DL" \
+            --location "$LOCATION" \
+            --ports 3000 \
+            --os-type Linux \
+            --cpu 1 \
+            --memory 2.0 \
+            --environment-variables \
+              MONGO_URI="$MONGO_URI" \
+              JWT_SECRET="$JWT_SECRET" \
+              MAIL_USER="$MAIL_USER" \
+              MAIL_PASS="$MAIL_PASS" \
+            --registry-login-server "$ACR_LOGIN_SERVER" \
+            --registry-username "${{ secrets.ACR_USERNAME }}" \
+            --registry-password "${{ secrets.ACR_PASSWORD }}" \
+            --restart-policy Always
+
+      - name: Mostrar estado
+        run: |
+          az container show -g "$RG" -n "$CONTAINER_NAME" \
+            --query "{FQDN:ipAddress.fqdn,State:instanceView.state,Ports:ipAddress.ports}" -o table
+
+      - name: Logs (opcional)
+        run: az container logs -g "$RG" -n "$CONTAINER_NAME" || true
