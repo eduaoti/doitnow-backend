@@ -1,4 +1,4 @@
-// ✅ index.js (listo para local y Azure) — versión con logs tempranos y server inmediato
+// ✅ index.js (listo para local y Azure) — versión con logs tempranos, AI y server inmediato
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
+// 🔌 Rutas
 const tareasRoutes = require('./routes/tareas.routes');
 const usuariosRoutes = require('./routes/usuarios.routes');
 
@@ -15,6 +16,38 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PROD = NODE_ENV === 'production';
 
 console.log('🟨 Booting backend… NODE_ENV=%s PORT=%s', NODE_ENV, PORT);
+
+// 📡 Application Insights (telemetría en vivo: Live Metrics, traces, exceptions)
+let ai; // cliente para eventos/errores personalizados
+try {
+  const appInsights = require('applicationinsights');
+  const conn = process.env.APPLICATIONINSIGHTS_CONNECTION_STRING
+            || process.env.APPINSIGHTS_CONNECTIONSTRING; // compat
+
+  if (conn) {
+    appInsights
+      .setup(conn)
+      .setSendLiveMetrics(true)
+      .setAutoCollectRequests(true)
+      .setAutoCollectDependencies(true)
+      .setAutoCollectExceptions(true)
+      .setAutoCollectPerformance(true, true)
+      .setAutoCollectConsole(true, true) // captura console.log/error
+      .start();
+
+    ai = appInsights.defaultClient;
+    // Etiquetas útiles para mapas y diagnóstico
+    ai.context.tags[ai.context.keys.cloudRole] = 'doinow-backend';
+    ai.context.tags[ai.context.keys.cloudRoleInstance] =
+      process.env.WEBSITE_INSTANCE_ID || process.env.HOSTNAME || 'local';
+
+    console.log('📡 Application Insights habilitado');
+  } else {
+    console.log('ℹ️ AI no configurado (falta APPLICATIONINSIGHTS_CONNECTION_STRING)');
+  }
+} catch (e) {
+  console.warn('ℹ️ Application Insights no instalado:', e?.message || e);
+}
 
 // --- Carpeta de uploads ---
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -46,7 +79,7 @@ app.use('/api/usuarios', usuariosRoutes);
 
 // Ruta de salud SIEMPRE disponible (sin depender de la DB)
 app.get('/health', (_req, res) => {
-  const state = mongoose.connection?.readyState; // 0=disconnected 1=connected 2=connecting 3=disconnecting
+  const state = mongoose.connection?.readyState; // 0=disc 1=conn 2=connecting 3=disconnecting
   res.json({ ok: true, env: NODE_ENV, dbState: state });
 });
 
@@ -68,27 +101,43 @@ if (IS_PROD) {
 
 // --- Conexión a Mongo (con eventos para loguear estado) ---
 if (IS_PROD) {
-  // Actívalo si quieres ver queries (ruidoso): mongoose.set('debug', true);
+  // mongoose.set('debug', true); // si quieres ver queries (ruidoso)
 }
 
 mongoose.connection.on('connecting', () => console.log('⏳ MongoDB connecting…'));
-mongoose.connection.on('error', err => console.error('❌ MongoDB error:', err?.message || err));
+mongoose.connection.on('error', err => {
+  console.error('❌ MongoDB error:', err?.message || err);
+  try { ai && ai.trackException({ exception: err }); } catch {}
+});
 mongoose.connection.on('disconnected', () => console.warn('⚠️  MongoDB disconnected'));
-mongoose.connection.once('open', () => console.log('✅ MongoDB connected'));
+mongoose.connection.once('open', () => {
+  console.log('✅ MongoDB connected');
+  try { ai && ai.trackEvent({ name: 'mongo_connected' }); } catch {}
+});
 
 mongoose.connect(process.env.MONGO_URI, {
-  // Opcionales: ajusta si usas SRV/Atlas moderno (normalmente basta con la URI)
   // serverSelectionTimeoutMS: 10000,
   // maxPoolSize: 10,
 }).catch(err => {
-  // No matamos el proceso: dejamos que el contenedor siga vivo y /health funcione
   console.error('❌ Error inicial conectando a MongoDB:', err?.message || err);
+  try { ai && ai.trackException({ exception: err }); } catch {}
 });
 
-// Manejo de errores globales para que se vean en logs
+// Manejo de errores globales para que se vean en logs + AI
 process.on('unhandledRejection', (reason) => {
   console.error('🔥 UnhandledRejection:', reason);
+  try {
+    const ex = reason instanceof Error ? reason : new Error(String(reason));
+    ai && ai.trackException({ exception: ex });
+  } catch {}
 });
 process.on('uncaughtException', (err) => {
   console.error('🔥 UncaughtException:', err);
+  try { ai && ai.trackException({ exception: err }); } catch {}
+});
+
+// Middleware de errores HTTP (reporta a AI)
+app.use((err, req, res, next) => {
+  try { ai && ai.trackException({ exception: err }); } catch {}
+  res.status(500).json({ message: 'Error interno' });
 });
