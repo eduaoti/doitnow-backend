@@ -1,26 +1,40 @@
-// telemetry.js (ESM)
-import appInsights from "applicationinsights";
+// lib/telemetry.js
+const appInsights = require('applicationinsights');
 
 const conn = process.env.APPLICATIONINSIGHTS_CONNECTION_STRING
-          || process.env.APPINSIGHTS_CONNECTIONSTRING; // por compatibilidad
+          || process.env.APPINSIGHTS_CONNECTIONSTRING;
+
+let client = null;
 
 if (conn) {
   appInsights
     .setup(conn)
-    .setSendLiveMetrics(true)        // Live Metrics en tiempo real
-    .setAutoCollectRequests(true)    // solicitudes HTTP
-    .setAutoCollectDependencies(true)// llamadas a Mongo/HTTP/etc.
-    .setAutoCollectExceptions(true)  // excepciones no controladas
+    .setSendLiveMetrics(true)
+    .setAutoCollectRequests(true)
+    .setAutoCollectDependencies(true)
+    .setAutoCollectExceptions(true)
     .setAutoCollectPerformance(true, true)
-    .setAutoCollectConsole(true, true) // console.log/console.error
+    .setAutoCollectConsole(true, true)
     .start();
 
-  // Nombre lógico en el mapa de aplicación
-  const c = appInsights.defaultClient;
-  c.context.tags[c.context.keys.cloudRole] = "doinow-backend";
-  c.context.tags[c.context.keys.cloudRoleInstance] = process.env.HOSTNAME || "appservice";
+  client = appInsights.defaultClient;
+  const keys = client.context.keys;
+  client.context.tags[keys.cloudRole] = 'doinow-backend';
+  client.context.tags[keys.cloudRoleInstance] =
+    process.env.WEBSITE_INSTANCE_ID || process.env.HOSTNAME || 'local';
 
-  console.log("📡 Application Insights habilitado");
+  console.log('📡 Application Insights habilitado');
+} else {
+  console.log('ℹ️ AI no configurado (falta APPLICATIONINSIGHTS_CONNECTION_STRING)');
 }
 
-export const aiClient = appInsights.defaultClient;
+module.exports = {
+  ai: client,
+  track: (name, props = {}) => client?.trackEvent({ name, properties: props }),
+  trace: (message, props = {}, severity = 1) =>
+    client?.trackTrace({ message, severity }, props),
+  exception: (err, props = {}) =>
+    client?.trackException({ exception: err, properties: props }),
+  metric: (name, value, props = {}) =>
+    client?.trackMetric({ name, value }, props),
+};

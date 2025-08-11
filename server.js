@@ -1,10 +1,22 @@
-// ✅ index.js (listo para local y Azure) — versión con logs tempranos, AI y server inmediato
+// ✅ index.js (listo para local y Azure) — logs tempranos, AI y server inmediato
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
+
+// Telemetría centralizada (usa ./lib/telemetry que ya creaste)
+let ai, track, exception, trace;
+try {
+  const tel = require('./lib/telemetry'); // { ai, track, exception, trace, metric }
+  ai = tel.ai;
+  track = tel.track;
+  exception = tel.exception;
+  trace = tel.trace;
+} catch (e) {
+  console.warn('ℹ️ Telemetry helper no disponible:', e?.message || e);
+}
 
 // 🔌 Rutas
 const tareasRoutes = require('./routes/tareas.routes');
@@ -16,38 +28,6 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PROD = NODE_ENV === 'production';
 
 console.log('🟨 Booting backend… NODE_ENV=%s PORT=%s', NODE_ENV, PORT);
-
-// 📡 Application Insights (telemetría en vivo: Live Metrics, traces, exceptions)
-let ai; // cliente para eventos/errores personalizados
-try {
-  const appInsights = require('applicationinsights');
-  const conn = process.env.APPLICATIONINSIGHTS_CONNECTION_STRING
-            || process.env.APPINSIGHTS_CONNECTIONSTRING; // compat
-
-  if (conn) {
-    appInsights
-      .setup(conn)
-      .setSendLiveMetrics(true)
-      .setAutoCollectRequests(true)
-      .setAutoCollectDependencies(true)
-      .setAutoCollectExceptions(true)
-      .setAutoCollectPerformance(true, true)
-      .setAutoCollectConsole(true, true) // captura console.log/error
-      .start();
-
-    ai = appInsights.defaultClient;
-    // Etiquetas útiles para mapas y diagnóstico
-    ai.context.tags[ai.context.keys.cloudRole] = 'doinow-backend';
-    ai.context.tags[ai.context.keys.cloudRoleInstance] =
-      process.env.WEBSITE_INSTANCE_ID || process.env.HOSTNAME || 'local';
-
-    console.log('📡 Application Insights habilitado');
-  } else {
-    console.log('ℹ️ AI no configurado (falta APPLICATIONINSIGHTS_CONNECTION_STRING)');
-  }
-} catch (e) {
-  console.warn('ℹ️ Application Insights no instalado:', e?.message || e);
-}
 
 // --- Carpeta de uploads ---
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -64,10 +44,11 @@ app.use(cors({
   credentials: true
 }));
 
-// (Opcional) Log de requests para ver tráfico en ACI/App Service
+// (Opcional) Log de requests para ver tráfico en App Service
 try {
   const morgan = require('morgan');
-  app.use(morgan('combined'));
+  // Si tienes auth, puedes exponer un id: morgan.token('uid', req => req.user?.id || '-');
+  app.use(morgan('combined')); // o ':method :url :status :response-time ms'
 } catch (_) { /* morgan no instalado, no pasa nada */ }
 
 app.use(express.json());
@@ -87,16 +68,25 @@ app.get('/health', (_req, res) => {
 if (IS_PROD) {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 HTTP server listening on :${PORT} (env=${NODE_ENV})`);
+    track && track('server_started', { env: NODE_ENV, port: String(PORT) });
   });
 } else {
-  const https = require('https');
-  const sslOptions = {
-    key: fs.readFileSync(path.join(__dirname, 'ssl', 'localhost-key.pem')),
-    cert: fs.readFileSync(path.join(__dirname, 'ssl', 'localhost.pem'))
-  };
-  https.createServer(sslOptions, app).listen(PORT, () => {
-    console.log(`🚀 HTTPS local on https://localhost:${PORT} (env=${NODE_ENV})`);
-  });
+  // HTTPS local; si faltan certificados, cae a HTTP sin romper
+  try {
+    const https = require('https');
+    const sslOptions = {
+      key: fs.readFileSync(path.join(__dirname, 'ssl', 'localhost-key.pem')),
+      cert: fs.readFileSync(path.join(__dirname, 'ssl', 'localhost.pem'))
+    };
+    https.createServer(sslOptions, app).listen(PORT, () => {
+      console.log(`🚀 HTTPS local on https://localhost:${PORT} (env=${NODE_ENV})`);
+    });
+  } catch (e) {
+    console.warn('⚠️ SSL local no disponible, iniciando HTTP:', e?.message || e);
+    app.listen(PORT, () => {
+      console.log(`🚀 HTTP local on http://localhost:${PORT} (env=${NODE_ENV})`);
+    });
+  }
 }
 
 // --- Conexión a Mongo (con eventos para loguear estado) ---
@@ -107,12 +97,12 @@ if (IS_PROD) {
 mongoose.connection.on('connecting', () => console.log('⏳ MongoDB connecting…'));
 mongoose.connection.on('error', err => {
   console.error('❌ MongoDB error:', err?.message || err);
-  try { ai && ai.trackException({ exception: err }); } catch {}
+  exception && exception(err, { origin: 'mongoose.connection' });
 });
 mongoose.connection.on('disconnected', () => console.warn('⚠️  MongoDB disconnected'));
 mongoose.connection.once('open', () => {
   console.log('✅ MongoDB connected');
-  try { ai && ai.trackEvent({ name: 'mongo_connected' }); } catch {}
+  track && track('mongo_connected');
 });
 
 mongoose.connect(process.env.MONGO_URI, {
@@ -120,24 +110,29 @@ mongoose.connect(process.env.MONGO_URI, {
   // maxPoolSize: 10,
 }).catch(err => {
   console.error('❌ Error inicial conectando a MongoDB:', err?.message || err);
-  try { ai && ai.trackException({ exception: err }); } catch {}
+  exception && exception(err, { origin: 'mongoose.connect' });
 });
 
 // Manejo de errores globales para que se vean en logs + AI
 process.on('unhandledRejection', (reason) => {
   console.error('🔥 UnhandledRejection:', reason);
-  try {
-    const ex = reason instanceof Error ? reason : new Error(String(reason));
-    ai && ai.trackException({ exception: ex });
-  } catch {}
+  const ex = reason instanceof Error ? reason : new Error(String(reason));
+  exception && exception(ex, { origin: 'unhandledRejection' });
 });
 process.on('uncaughtException', (err) => {
   console.error('🔥 UncaughtException:', err);
-  try { ai && ai.trackException({ exception: err }); } catch {}
+  exception && exception(err, { origin: 'uncaughtException' });
+});
+
+// Cierre elegante (útil en App Service)
+process.on('SIGTERM', () => {
+  console.log('🛑 SIGTERM recibido, cerrando servidor…');
+  track && track('server_stopping', { reason: 'SIGTERM' });
+  setTimeout(() => process.exit(0), 500);
 });
 
 // Middleware de errores HTTP (reporta a AI)
 app.use((err, req, res, next) => {
-  try { ai && ai.trackException({ exception: err }); } catch {}
+  exception && exception(err, { path: req.path, method: req.method });
   res.status(500).json({ message: 'Error interno' });
 });
