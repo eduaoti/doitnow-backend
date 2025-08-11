@@ -50,9 +50,10 @@ jobs:
       DOCKERHUB_REPO: doinow-backend
 
       # ===== Observabilidad / Logs =====
-      LOG_ANALYTICS_WORKSPACE_ID:   ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
-      LOG_ANALYTICS_WORKSPACE_KEY:  ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
-      APPINSIGHTS_CONNECTIONSTRING: ${{ secrets.APPINSIGHTS_CONNECTIONSTRING }}
+      LOG_ANALYTICS_WORKSPACE_ID:      ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+      LOG_ANALYTICS_WORKSPACE_KEY:     ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
+      APPINSIGHTS_CONNECTIONSTRING:    ${{ secrets.APPLICATIONINSIGHTS_CONNECTION_STRING }}
+      APPLICATIONINSIGHTS_CONNECTION_STRING: ${{ secrets.APPLICATIONINSIGHTS_CONNECTION_STRING }}
 
     steps:
       - uses: actions/checkout@v4
@@ -114,60 +115,36 @@ jobs:
             echo "No hay ACI antiguos para borrar."
           fi
 
-      # ---------- ACI (HTTP) + LOG ANALYTICS con retry ----------
-      - name: Deploy to Azure Container Instances (HTTP + Logs) con retry si cuota
+      # ---------- ACI (HTTP) + LOG ANALYTICS ----------
+      - name: Deploy to Azure Container Instances (HTTP + Logs)
         run: |
-          set -e
-          attempt_create() {
-            az container create \
-              --resource-group "$RG" \
-              --name "$CONTAINER_NAME" \
-              --image "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
-              --dns-name-label "${DNS_LABEL}" \
-              --location "$LOCATION" \
-              --ports 3000 \
-              --os-type Linux \
-              --cpu 1 \
-              --memory 2.0 \
-              --environment-variables \
-                PORT=3000 \
-                USE_HTTPS=false \
-                NODE_ENV="$NODE_ENV" \
-                MONGO_URI="$MONGO_URI" \
-                JWT_SECRET="$JWT_SECRET" \
-                MAIL_USER="$MAIL_USER" \
-                MAIL_PASS="$MAIL_PASS" \
-                FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-*}" \
-                APPINSIGHTS_CONNECTIONSTRING="$APPINSIGHTS_CONNECTIONSTRING" \
-              --registry-login-server "$ACR_LOGIN_SERVER" \
-              --registry-username "${{ secrets.ACR_USERNAME }}" \
-              --registry-password "${{ secrets.ACR_PASSWORD }}" \
-              --restart-policy Always \
-              --log-analytics-workspace "$LOG_ANALYTICS_WORKSPACE_ID" \
-              --log-analytics-workspace-key "$LOG_ANALYTICS_WORKSPACE_KEY"
-          }
-
-          set +e
-          attempt_create
-          RC=$?
-          if [ $RC -ne 0 ]; then
-            echo "Primera creación falló, intentando detectar si es por cuota..."
-            if az container list-usage --location "$LOCATION" --output tsv 2>/dev/null | grep -qi "StandardCores"; then
-              echo "Uso de cores en región:"
-              az container list-usage --location "$LOCATION" -o table || true
-            fi
-            # Si fue por quota, intenta limpiar todo lo que tenga el prefijo y reintenta
-            echo "Forzando limpieza adicional por si quedan grupos huérfanos..."
-            az container list -g "$RG" --query "[?starts_with(name, 'doinow-back-')].name" -o tsv | xargs -I {} az container delete -g "$RG" -n {} -y || true
-            echo "Reintentando creación..."
-            attempt_create
-            RC=$?
-          fi
-          set -e
-          if [ $RC -ne 0 ]; then
-            echo "Fallo creando el ACI tras retry."
-            exit $RC
-          fi
+          az container create \
+            --resource-group "$RG" \
+            --name "$CONTAINER_NAME" \
+            --image "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
+            --dns-name-label "${DNS_LABEL}" \
+            --location "$LOCATION" \
+            --ports 3000 \
+            --os-type Linux \
+            --cpu 1 \
+            --memory 2.0 \
+            --environment-variables \
+              PORT=3000 \
+              USE_HTTPS=false \
+              NODE_ENV="$NODE_ENV" \
+              MONGO_URI="$MONGO_URI" \
+              JWT_SECRET="$JWT_SECRET" \
+              MAIL_USER="$MAIL_USER" \
+              MAIL_PASS="$MAIL_PASS" \
+              FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-*}" \
+              APPLICATIONINSIGHTS_CONNECTION_STRING="$APPLICATIONINSIGHTS_CONNECTION_STRING" \
+              APPINSIGHTS_CONNECTIONSTRING="$APPLICATIONINSIGHTS_CONNECTION_STRING" \
+            --registry-login-server "$ACR_LOGIN_SERVER" \
+            --registry-username "${{ secrets.ACR_USERNAME }}" \
+            --registry-password "${{ secrets.ACR_PASSWORD }}" \
+            --restart-policy Always \
+            --log-analytics-workspace "$LOG_ANALYTICS_WORKSPACE_ID" \
+            --log-analytics-workspace-key "$LOG_ANALYTICS_WORKSPACE_KEY"
 
       - name: Mostrar estado ACI (HTTP)
         run: |
@@ -190,31 +167,16 @@ jobs:
         run: |
           FQDN=$(az container show -g "$RG" -n "$CONTAINER_NAME" --query ipAddress.fqdn -o tsv)
           echo "FQDN: $FQDN"
-          for i in {1..12}; do
+          for i in {1..24}; do   # más paciencia: 2 minutos
             if curl -fsS --max-time 5 "http://$FQDN:3000/health"; then
               echo "Health OK"
               exit 0
             fi
-            echo "Aún no responde, reintento $i/12..."
+            echo "Aún no responde, reintento $i/24..."
             sleep 5
           done
           echo "Healthcheck falló"
           exit 1
-
-      # ---------- DIAGNÓSTICO SI FALLA ACI ----------
-      - name: Diagnóstico ACI (events + logs) si falla
-        if: failure()
-        run: |
-          echo "=== ACI STATE ==="
-          az container show -g "$RG" -n "$CONTAINER_NAME" \
-            --query "{State:instanceView.state,Prov:provisioningState,Ports:ipAddress.ports}" -o table || true
-
-          echo "=== ACI EVENTS ==="
-          az container show -g "$RG" -n "$CONTAINER_NAME" \
-            --query "containers[0].instanceView.events" || true
-
-          echo "=== ACI LOGS (tail) ==="
-          az container logs -g "$RG" -n "$CONTAINER_NAME" || true
 
       # ---------- APP SERVICE (HTTPS externo, HTTP interno) ----------
       - name: Esperar a que Microsoft.Web esté Registered
@@ -234,7 +196,7 @@ jobs:
           || az appservice plan create -g "$RG" -n "$PLAN" --is-linux --sku B1 --location "$LOCATION"
           echo "APP_SERVICE_PLAN=$PLAN" >> $GITHUB_ENV
 
-      - name: Crear/usar Web App for Containers (nombre único si no hay secret)
+      - name: Crear/usar Web App for Containers
         run: |
           PLAN="$APP_SERVICE_PLAN"
           WN="${WEBAPP_NAME}"
@@ -265,8 +227,8 @@ jobs:
                       MAIL_USER="$MAIL_USER" \
                       MAIL_PASS="$MAIL_PASS" \
                       FRONTEND_ORIGIN="${FRONTEND_ORIGIN}" \
-                      APPINSIGHTS_CONNECTIONSTRING="$APPINSIGHTS_CONNECTIONSTRING" \
-                      APPLICATIONINSIGHTS_CONNECTION_STRING="$APPINSIGHTS_CONNECTIONSTRING"
+                      APPLICATIONINSIGHTS_CONNECTION_STRING="$APPLICATIONINSIGHTS_CONNECTION_STRING" \
+                      APPINSIGHTS_CONNECTIONSTRING="$APPLICATIONINSIGHTS_CONNECTION_STRING"
 
           echo "WEBAPP_NAME=$WN" >> $GITHUB_ENV
 
