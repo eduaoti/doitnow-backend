@@ -50,8 +50,8 @@ jobs:
       DOCKERHUB_REPO: doinow-backend
 
       # ===== Observabilidad / Logs =====
-      LOG_ANALYTICS_WORKSPACE_ID:  ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
-      LOG_ANALYTICS_WORKSPACE_KEY: ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
+      LOG_ANALYTICS_WORKSPACE_ID:   ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+      LOG_ANALYTICS_WORKSPACE_KEY:  ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
       APPINSIGHTS_CONNECTIONSTRING: ${{ secrets.APPINSIGHTS_CONNECTIONSTRING }}
 
     steps:
@@ -152,30 +152,35 @@ jobs:
             echo "ACI no llegó a Running"; exit 1
           fi
 
-      - name: Probar /health
+      - name: Probar /health (puerto 3000)
         run: |
           FQDN=$(az container show -g "$RG" -n "$CONTAINER_NAME" --query ipAddress.fqdn -o tsv)
           echo "FQDN: $FQDN"
-          curl -sS "http://$FQDN/health" || (echo "Healthcheck falló" && exit 1)
+          for i in {1..12}; do
+            if curl -fsS --max-time 5 "http://$FQDN:3000/health"; then
+              echo "Health OK"
+              exit 0
+            fi
+            echo "Aún no responde, reintento $i/12..."
+            sleep 5
+          done
+          echo "Healthcheck falló"
+          exit 1
 
       # ---------- DIAGNÓSTICO SI FALLA ACI ----------
       - name: Diagnóstico ACI (events + logs) si falla
         if: failure()
-        env:
-          API_VER: 2024-10-01-preview
         run: |
-          set +e
-          SUBS=$(az account show --query id -o tsv)
+          echo "=== ACI STATE ==="
+          az container show -g "$RG" -n "$CONTAINER_NAME" \
+            --query "{State:instanceView.state,Prov:provisioningState,Ports:ipAddress.ports}" -o table || true
+
           echo "=== ACI EVENTS ==="
-          az rest --method get \
-            --url "https://management.azure.com/subscriptions/$SUBS/resourceGroups/$RG/providers/Microsoft.ContainerInstance/containerGroups/$CONTAINER_NAME?api-version=$API_VER" \
-            --query "properties.containers[0].instanceView.events" || true
-          echo "=== ACI LOGS (tail 500) ==="
-          CONT=$(az container show -g "$RG" -n "$CONTAINER_NAME" --query "containers[0].name" -o tsv || echo "$CONTAINER_NAME")
-          az rest --method post \
-            --url "https://management.azure.com/subscriptions/$SUBS/resourceGroups/$RG/providers/Microsoft.ContainerInstance/containerGroups/$CONTAINER_NAME/containers/$CONT/listLogs?api-version=$API_VER" \
-            --body '{"tail":500}' \
-            --query content || true
+          az container show -g "$RG" -n "$CONTAINER_NAME" \
+            --query "containers[0].instanceView.events" || true
+
+          echo "=== ACI LOGS (tail) ==="
+          az container logs -g "$RG" -n "$CONTAINER_NAME" || true
 
       # ---------- APP SERVICE (HTTPS externo, HTTP interno) ----------
       - name: Esperar a que Microsoft.Web esté Registered
