@@ -30,22 +30,24 @@ jobs:
       RG:               ${{ secrets.AZURE_RESOURCE_GROUP }}
       LOCATION:         ${{ secrets.AZURE_LOCATION }}
 
-      # ===== Imagen (ahora doinow) =====
+      # ===== Imagen =====
       IMAGE_NAME: doinow-backend
       IMAGE_TAG:  ${{ github.sha }}
 
       # ===== Contenedor (ACI) =====
       CONTAINER_NAME: doinow-backend
-      DNS_LABEL:     doinow-back-eduaoti   # cambialo si ya existe
+      # DNS_LABEL se generará dinámicamente más abajo
 
       # ===== Vars de la app =====
-      MONGO_URI:  ${{ secrets.MONGO_URI }}
-      JWT_SECRET: ${{ secrets.JWT_SECRET }}
-      MAIL_USER:  ${{ secrets.MAIL_USER }}
-      MAIL_PASS:  ${{ secrets.MAIL_PASS }}
+      MONGO_URI:        ${{ secrets.MONGO_URI }}
+      JWT_SECRET:       ${{ secrets.JWT_SECRET }}
+      MAIL_USER:        ${{ secrets.MAIL_USER }}
+      MAIL_PASS:        ${{ secrets.MAIL_PASS }}
+      FRONTEND_ORIGIN:  ${{ secrets.FRONTEND_ORIGIN }} # p.ej. https://doitnow-front-xxx.eastus.azurecontainer.io
+      NODE_ENV:         production
 
-      # ===== Docker Hub =====
-      DOCKERHUB_REPO: doinow-backend   # <- nombre del repo en Docker Hub
+      # ===== Docker Hub (opcional) =====
+      DOCKERHUB_REPO: doinow-backend
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +68,6 @@ jobs:
           docker build --platform linux/amd64 -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG .
           docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
 
-      # ===== Docker Hub: se salta si no hay secrets =====
       - name: Docker Hub login (skip si no hay secrets)
         run: |
           if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
@@ -79,26 +80,35 @@ jobs:
         run: |
           if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
             DH_REPO="${{ secrets.DOCKERHUB_USERNAME }}/${DOCKERHUB_REPO}"
-            docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG $DH_REPO:$IMAGE_TAG
+            docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG $DH_REPO:${GITHUB_SHA::7}
             docker tag $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG $DH_REPO:latest
-            docker push $DH_REPO:$IMAGE_TAG
+            docker push $DH_REPO:${GITHUB_SHA::7}
             docker push $DH_REPO:latest
           else
             echo "No Docker Hub secrets; skipping push."
           fi
 
+      # ===== NUEVO: generar DNS label único =====
+      - name: Generar DNS label único
+        run: |
+          BASE="doinow-back"
+          SUF="${GITHUB_SHA::6}-${GITHUB_RUN_NUMBER}"
+          DNS_LABEL="$(echo "${BASE}-${SUF}" | tr '[:upper:]' '[:lower:]' | cut -c1-60)"
+          echo "DNS_LABEL=${DNS_LABEL}" >> $GITHUB_ENV
+          echo "DNS_LABEL generado: ${DNS_LABEL}"
+
       - name: Deploy to Azure Container Instances
         run: |
           CN="${CONTAINER_NAME}"
-          DL="${DNS_LABEL}"
 
+          # Eliminar el container group previo (si existe)
           az container delete -g "$RG" -n "$CN" -y || true
 
           az container create \
             --resource-group "$RG" \
             --name "$CN" \
             --image "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
-            --dns-name-label "$DL" \
+            --dns-name-label "${DNS_LABEL}" \
             --location "$LOCATION" \
             --ports 3000 \
             --os-type Linux \
@@ -109,6 +119,8 @@ jobs:
               JWT_SECRET="$JWT_SECRET" \
               MAIL_USER="$MAIL_USER" \
               MAIL_PASS="$MAIL_PASS" \
+              NODE_ENV="$NODE_ENV" \
+              FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-*}" \
             --registry-login-server "$ACR_LOGIN_SERVER" \
             --registry-username "${{ secrets.ACR_USERNAME }}" \
             --registry-password "${{ secrets.ACR_PASSWORD }}" \
