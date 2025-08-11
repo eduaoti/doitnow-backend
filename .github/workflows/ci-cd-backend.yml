@@ -42,15 +42,20 @@ jobs:
       JWT_SECRET:       ${{ secrets.JWT_SECRET }}
       MAIL_USER:        ${{ secrets.MAIL_USER }}
       MAIL_PASS:        ${{ secrets.MAIL_PASS }}
-      FRONTEND_ORIGIN:  ${{ secrets.FRONTEND_ORIGIN }}  # p.ej. https://doinow-front-12-1.azurewebsites.net
+      FRONTEND_ORIGIN:  ${{ secrets.FRONTEND_ORIGIN }}
       NODE_ENV:         production
 
       # ===== App Service (HTTPS) =====
-      APP_SERVICE_PLAN: ${{ secrets.APP_SERVICE_PLAN }} # default se setea en bash
-      WEBAPP_NAME:      ${{ secrets.WEBAPP_NAME }}      # default único se genera en bash
+      APP_SERVICE_PLAN: ${{ secrets.APP_SERVICE_PLAN }}
+      WEBAPP_NAME:      ${{ secrets.WEBAPP_NAME }}
 
       # ===== Docker Hub (opcional) =====
       DOCKERHUB_REPO: doinow-backend
+
+      # ===== Observabilidad / Logs =====
+      LOG_ANALYTICS_WORKSPACE_ID:  ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+      LOG_ANALYTICS_WORKSPACE_KEY: ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
+      APPINSIGHTS_CONNECTIONSTRING: ${{ secrets.APPINSIGHTS_CONNECTIONSTRING }}
 
     steps:
       - uses: actions/checkout@v4
@@ -91,7 +96,7 @@ jobs:
             echo "No Docker Hub secrets; skipping push."
           fi
 
-      # ====== ACI (HTTP) como ya lo tenías ======
+      # ====== ACI (HTTP) con Log Analytics ======
       - name: Generar DNS label único
         run: |
           BASE="doinow-back"
@@ -100,7 +105,7 @@ jobs:
           echo "DNS_LABEL=${DNS_LABEL}" >> $GITHUB_ENV
           echo "DNS_LABEL generado: ${DNS_LABEL}"
 
-      - name: Deploy to Azure Container Instances (HTTP)
+      - name: Deploy to Azure Container Instances (HTTP + Logs)
         run: |
           CN="${CONTAINER_NAME}"
           az container delete -g "$RG" -n "$CN" -y || true
@@ -122,17 +127,20 @@ jobs:
               MAIL_PASS="$MAIL_PASS" \
               NODE_ENV="$NODE_ENV" \
               FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-*}" \
+              APPINSIGHTS_CONNECTIONSTRING="$APPINSIGHTS_CONNECTIONSTRING" \
             --registry-login-server "$ACR_LOGIN_SERVER" \
             --registry-username "${{ secrets.ACR_USERNAME }}" \
             --registry-password "${{ secrets.ACR_PASSWORD }}" \
-            --restart-policy Always
+            --restart-policy Always \
+            --log-analytics-workspace "$LOG_ANALYTICS_WORKSPACE_ID" \
+            --log-analytics-workspace-key "$LOG_ANALYTICS_WORKSPACE_KEY"
 
       - name: Mostrar estado ACI (HTTP)
         run: |
           az container show -g "$RG" -n "$CONTAINER_NAME" \
             --query "{FQDN:ipAddress.fqdn,State:instanceView.state,Ports:ipAddress.ports}" -o table
 
-      # ====== App Service (HTTPS) adicional ======
+      # ====== App Service (HTTPS) + Application Insights ======
       - name: Esperar a que Microsoft.Web esté Registered
         run: |
           for i in {1..40}; do
@@ -165,7 +173,7 @@ jobs:
               --deployment-container-image-name "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
           fi
 
-          # Contenedor (ACR) + puerto del backend (3000) + envs
+          # Contenedor (ACR) + puerto + settings (incluye App Insights)
           az webapp config container set -g "$RG" -n "$WN" \
             --docker-custom-image-name "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
             --docker-registry-server-url "https://$ACR_LOGIN_SERVER" \
@@ -179,9 +187,16 @@ jobs:
                       JWT_SECRET="$JWT_SECRET" \
                       MAIL_USER="$MAIL_USER" \
                       MAIL_PASS="$MAIL_PASS" \
-                      FRONTEND_ORIGIN="${FRONTEND_ORIGIN}"
+                      FRONTEND_ORIGIN="${FRONTEND_ORIGIN}" \
+                      APPINSIGHTS_CONNECTIONSTRING="$APPINSIGHTS_CONNECTIONSTRING" \
+                      APPLICATIONINSIGHTS_CONNECTION_STRING="$APPINSIGHTS_CONNECTIONSTRING"
 
           echo "WEBAPP_NAME=$WN" >> $GITHUB_ENV
+
+      - name: Habilitar logs básicos en App Service (opcional)
+        run: |
+          az webapp log config -g "$RG" -n "$WEBAPP_NAME" --application-logging filesystem --level information
+          az webapp log tail -g "$RG" -n "$WEBAPP_NAME" --provider appservice --verbose & sleep 1 || true
 
       - name: Reiniciar Web App
         run: az webapp restart -g "$RG" -n "$WEBAPP_NAME"
