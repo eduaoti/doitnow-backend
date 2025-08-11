@@ -34,9 +34,6 @@ jobs:
       IMAGE_NAME: doinow-backend
       IMAGE_TAG:  ${{ github.sha }}
 
-      # ===== ACI =====
-      CONTAINER_NAME: doinow-backend
-
       # ===== Vars de la app =====
       MONGO_URI:        ${{ secrets.MONGO_URI }}
       JWT_SECRET:       ${{ secrets.JWT_SECRET }}
@@ -68,6 +65,16 @@ jobs:
       - name: Validar sesión
         run: az account show
 
+      # ---------- NOMBRES ÚNICOS PARA ACI ----------
+      - name: Definir nombres únicos (ACI)
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          CN="doinow-back-${SHORT_SHA}-${GITHUB_RUN_NUMBER}"
+          DNS_LABEL="$(echo "doinow-back-${SHORT_SHA}-${GITHUB_RUN_NUMBER}" | tr '[:upper:]' '[:lower:]' | cut -c1-60)"
+          echo "CONTAINER_NAME=${CN}" >> $GITHUB_ENV
+          echo "DNS_LABEL=${DNS_LABEL}" >> $GITHUB_ENV
+          echo "Usando CONTAINER_NAME=${CN} y DNS_LABEL=${DNS_LABEL}"
+
       - name: Login a ACR (RBAC)
         run: az acr login -n "$ACR_NAME"
 
@@ -96,23 +103,14 @@ jobs:
             echo "No Docker Hub secrets; skipping push."
           fi
 
-      # ====== ACI (HTTP) con Log Analytics ======
-      - name: Generar DNS label único
-        run: |
-          BASE="doinow-back"
-          SUF="${GITHUB_SHA::6}-${GITHUB_RUN_NUMBER}"
-          DNS_LABEL="$(echo "${BASE}-${SUF}" | tr '[:upper:]' '[:lower:]' | cut -c1-60)"
-          echo "DNS_LABEL=${DNS_LABEL}" >> $GITHUB_ENV
-          echo "DNS_LABEL generado: ${DNS_LABEL}"
-
+      # ---------- ACI (HTTP) + LOG ANALYTICS ----------
       - name: Deploy to Azure Container Instances (HTTP + Logs)
         run: |
-          CN="${CONTAINER_NAME}"
-          az container delete -g "$RG" -n "$CN" -y || true
+          az container delete -g "$RG" -n "$CONTAINER_NAME" -y || true
 
           az container create \
             --resource-group "$RG" \
-            --name "$CN" \
+            --name "$CONTAINER_NAME" \
             --image "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
             --dns-name-label "${DNS_LABEL}" \
             --location "$LOCATION" \
@@ -121,11 +119,13 @@ jobs:
             --cpu 1 \
             --memory 2.0 \
             --environment-variables \
+              PORT=3000 \
+              USE_HTTPS=false \
+              NODE_ENV="$NODE_ENV" \
               MONGO_URI="$MONGO_URI" \
               JWT_SECRET="$JWT_SECRET" \
               MAIL_USER="$MAIL_USER" \
               MAIL_PASS="$MAIL_PASS" \
-              NODE_ENV="$NODE_ENV" \
               FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-*}" \
               APPINSIGHTS_CONNECTIONSTRING="$APPINSIGHTS_CONNECTIONSTRING" \
             --registry-login-server "$ACR_LOGIN_SERVER" \
@@ -140,7 +140,44 @@ jobs:
           az container show -g "$RG" -n "$CONTAINER_NAME" \
             --query "{FQDN:ipAddress.fqdn,State:instanceView.state,Ports:ipAddress.ports}" -o table
 
-      # ====== App Service (HTTPS) + Application Insights ======
+      - name: Esperar a que ACI esté Running (timeout ~2m)
+        run: |
+          for i in {1..24}; do
+            ST=$(az container show -g "$RG" -n "$CONTAINER_NAME" --query instanceView.state -o tsv || echo "Unknown")
+            echo "Estado actual: $ST"
+            if [ "$ST" = "Running" ]; then break; fi
+            sleep 5
+          done
+          if [ "$ST" != "Running" ]; then
+            echo "ACI no llegó a Running"; exit 1
+          fi
+
+      - name: Probar /health
+        run: |
+          FQDN=$(az container show -g "$RG" -n "$CONTAINER_NAME" --query ipAddress.fqdn -o tsv)
+          echo "FQDN: $FQDN"
+          curl -sS "http://$FQDN/health" || (echo "Healthcheck falló" && exit 1)
+
+      # ---------- DIAGNÓSTICO SI FALLA ACI ----------
+      - name: Diagnóstico ACI (events + logs) si falla
+        if: failure()
+        env:
+          API_VER: 2024-10-01-preview
+        run: |
+          set +e
+          SUBS=$(az account show --query id -o tsv)
+          echo "=== ACI EVENTS ==="
+          az rest --method get \
+            --url "https://management.azure.com/subscriptions/$SUBS/resourceGroups/$RG/providers/Microsoft.ContainerInstance/containerGroups/$CONTAINER_NAME?api-version=$API_VER" \
+            --query "properties.containers[0].instanceView.events" || true
+          echo "=== ACI LOGS (tail 500) ==="
+          CONT=$(az container show -g "$RG" -n "$CONTAINER_NAME" --query "containers[0].name" -o tsv || echo "$CONTAINER_NAME")
+          az rest --method post \
+            --url "https://management.azure.com/subscriptions/$SUBS/resourceGroups/$RG/providers/Microsoft.ContainerInstance/containerGroups/$CONTAINER_NAME/containers/$CONT/listLogs?api-version=$API_VER" \
+            --body '{"tail":500}' \
+            --query content || true
+
+      # ---------- APP SERVICE (HTTPS externo, HTTP interno) ----------
       - name: Esperar a que Microsoft.Web esté Registered
         run: |
           for i in {1..40}; do
@@ -173,7 +210,6 @@ jobs:
               --deployment-container-image-name "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
           fi
 
-          # Contenedor (ACR) + puerto + settings (incluye App Insights)
           az webapp config container set -g "$RG" -n "$WN" \
             --docker-custom-image-name "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
             --docker-registry-server-url "https://$ACR_LOGIN_SERVER" \
@@ -182,6 +218,8 @@ jobs:
 
           az webapp config appsettings set -g "$RG" -n "$WN" \
             --settings WEBSITES_PORT=3000 \
+                      PORT=3000 \
+                      USE_HTTPS=false \
                       NODE_ENV=production \
                       MONGO_URI="$MONGO_URI" \
                       JWT_SECRET="$JWT_SECRET" \
@@ -192,11 +230,6 @@ jobs:
                       APPLICATIONINSIGHTS_CONNECTION_STRING="$APPINSIGHTS_CONNECTIONSTRING"
 
           echo "WEBAPP_NAME=$WN" >> $GITHUB_ENV
-
-      - name: Habilitar logs básicos en App Service (opcional)
-        run: |
-          az webapp log config -g "$RG" -n "$WEBAPP_NAME" --application-logging filesystem --level information
-          az webapp log tail -g "$RG" -n "$WEBAPP_NAME" --provider appservice --verbose & sleep 1 || true
 
       - name: Reiniciar Web App
         run: az webapp restart -g "$RG" -n "$WEBAPP_NAME"
