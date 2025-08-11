@@ -1,4 +1,4 @@
-// ✅ index.js (listo para local y Azure)
+// ✅ index.js (listo para local y Azure) — versión con logs tempranos y server inmediato
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
@@ -14,22 +14,28 @@ const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PROD = NODE_ENV === 'production';
 
-// --- Carpeta de uploads (si no existe, se crea) ---
+console.log('🟨 Booting backend… NODE_ENV=%s PORT=%s', NODE_ENV, PORT);
+
+// --- Carpeta de uploads ---
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
 // --- CORS ---
-// En prod puedes pasar FRONTEND_ORIGIN="https://tu-frontend.azurecontainer.io"
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || (IS_PROD ? '*' : 'https://localhost:5173');
-
 app.use(cors({
   origin: FRONTEND_ORIGIN,
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 }));
+
+// (Opcional) Log de requests para ver tráfico en ACI/App Service
+try {
+  const morgan = require('morgan');
+  app.use(morgan('combined'));
+} catch (_) { /* morgan no instalado, no pasa nada */ }
 
 app.use(express.json());
 app.use('/uploads', express.static(uploadsDir));
@@ -38,34 +44,51 @@ app.use('/uploads', express.static(uploadsDir));
 app.use('/api/tareas', tareasRoutes);
 app.use('/api/usuarios', usuariosRoutes);
 
-// Ruta de salud para pruebas en Azure
+// Ruta de salud SIEMPRE disponible (sin depender de la DB)
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, env: NODE_ENV });
+  const state = mongoose.connection?.readyState; // 0=disconnected 1=connected 2=connecting 3=disconnecting
+  res.json({ ok: true, env: NODE_ENV, dbState: state });
 });
 
-// --- DB + servidor ---
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => {
-    console.log('✅ Conectado a MongoDB');
-
-    if (IS_PROD) {
-      // En Azure/producción: HTTP simple (el proxy de Azure maneja HTTPS)
-      app.listen(PORT, '0.0.0.0', () => {
-        console.log(`🚀 Servidor HTTP corriendo en puerto ${PORT} (modo ${NODE_ENV})`);
-      });
-    } else {
-      // En local: HTTPS con certificados
-      const https = require('https');
-      const sslOptions = {
-        key: fs.readFileSync(path.join(__dirname, 'ssl', 'localhost-key.pem')),
-        cert: fs.readFileSync(path.join(__dirname, 'ssl', 'localhost.pem'))
-      };
-      https.createServer(sslOptions, app).listen(PORT, () => {
-        console.log(`🚀 Servidor HTTPS corriendo en https://localhost:${PORT} (modo ${NODE_ENV})`);
-      });
-    }
-  })
-  .catch(err => {
-    console.error('❌ Error conectando a MongoDB', err);
-    process.exit(1);
+// --- Arrancar el servidor de inmediato ---
+if (IS_PROD) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 HTTP server listening on :${PORT} (env=${NODE_ENV})`);
   });
+} else {
+  const https = require('https');
+  const sslOptions = {
+    key: fs.readFileSync(path.join(__dirname, 'ssl', 'localhost-key.pem')),
+    cert: fs.readFileSync(path.join(__dirname, 'ssl', 'localhost.pem'))
+  };
+  https.createServer(sslOptions, app).listen(PORT, () => {
+    console.log(`🚀 HTTPS local on https://localhost:${PORT} (env=${NODE_ENV})`);
+  });
+}
+
+// --- Conexión a Mongo (con eventos para loguear estado) ---
+if (IS_PROD) {
+  // Actívalo si quieres ver queries (ruidoso): mongoose.set('debug', true);
+}
+
+mongoose.connection.on('connecting', () => console.log('⏳ MongoDB connecting…'));
+mongoose.connection.on('error', err => console.error('❌ MongoDB error:', err?.message || err));
+mongoose.connection.on('disconnected', () => console.warn('⚠️  MongoDB disconnected'));
+mongoose.connection.once('open', () => console.log('✅ MongoDB connected'));
+
+mongoose.connect(process.env.MONGO_URI, {
+  // Opcionales: ajusta si usas SRV/Atlas moderno (normalmente basta con la URI)
+  // serverSelectionTimeoutMS: 10000,
+  // maxPoolSize: 10,
+}).catch(err => {
+  // No matamos el proceso: dejamos que el contenedor siga vivo y /health funcione
+  console.error('❌ Error inicial conectando a MongoDB:', err?.message || err);
+});
+
+// Manejo de errores globales para que se vean en logs
+process.on('unhandledRejection', (reason) => {
+  console.error('🔥 UnhandledRejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('🔥 UncaughtException:', err);
+});
