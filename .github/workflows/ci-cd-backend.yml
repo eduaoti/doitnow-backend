@@ -34,17 +34,20 @@ jobs:
       IMAGE_NAME: doinow-backend
       IMAGE_TAG:  ${{ github.sha }}
 
-      # ===== Contenedor (ACI) =====
+      # ===== ACI =====
       CONTAINER_NAME: doinow-backend
-      # DNS_LABEL se generará dinámicamente más abajo
 
       # ===== Vars de la app =====
       MONGO_URI:        ${{ secrets.MONGO_URI }}
       JWT_SECRET:       ${{ secrets.JWT_SECRET }}
       MAIL_USER:        ${{ secrets.MAIL_USER }}
       MAIL_PASS:        ${{ secrets.MAIL_PASS }}
-      FRONTEND_ORIGIN:  ${{ secrets.FRONTEND_ORIGIN }} # p.ej. https://doitnow-front-xxx.eastus.azurecontainer.io
+      FRONTEND_ORIGIN:  ${{ secrets.FRONTEND_ORIGIN }}  # p.ej. https://doinow-front-12-1.azurewebsites.net
       NODE_ENV:         production
+
+      # ===== App Service (HTTPS) =====
+      APP_SERVICE_PLAN: ${{ secrets.APP_SERVICE_PLAN }} # default se setea en bash
+      WEBAPP_NAME:      ${{ secrets.WEBAPP_NAME }}      # default único se genera en bash
 
       # ===== Docker Hub (opcional) =====
       DOCKERHUB_REPO: doinow-backend
@@ -88,7 +91,7 @@ jobs:
             echo "No Docker Hub secrets; skipping push."
           fi
 
-      # ===== NUEVO: generar DNS label único =====
+      # ====== ACI (HTTP) como ya lo tenías ======
       - name: Generar DNS label único
         run: |
           BASE="doinow-back"
@@ -97,11 +100,9 @@ jobs:
           echo "DNS_LABEL=${DNS_LABEL}" >> $GITHUB_ENV
           echo "DNS_LABEL generado: ${DNS_LABEL}"
 
-      - name: Deploy to Azure Container Instances
+      - name: Deploy to Azure Container Instances (HTTP)
         run: |
           CN="${CONTAINER_NAME}"
-
-          # Eliminar el container group previo (si existe)
           az container delete -g "$RG" -n "$CN" -y || true
 
           az container create \
@@ -126,10 +127,67 @@ jobs:
             --registry-password "${{ secrets.ACR_PASSWORD }}" \
             --restart-policy Always
 
-      - name: Mostrar estado
+      - name: Mostrar estado ACI (HTTP)
         run: |
           az container show -g "$RG" -n "$CONTAINER_NAME" \
             --query "{FQDN:ipAddress.fqdn,State:instanceView.state,Ports:ipAddress.ports}" -o table
 
-      - name: Logs (opcional)
-        run: az container logs -g "$RG" -n "$CONTAINER_NAME" || true
+      # ====== App Service (HTTPS) adicional ======
+      - name: Esperar a que Microsoft.Web esté Registered
+        run: |
+          for i in {1..40}; do
+            state=$(az provider show -n Microsoft.Web --query registrationState -o tsv || echo "Unknown")
+            echo "Microsoft.Web registrationState=$state"
+            if [ "$state" = "Registered" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "Timeout esperando Microsoft.Web=Registered"; exit 1
+
+      - name: Crear/usar App Service Plan (Linux)
+        run: |
+          PLAN="${APP_SERVICE_PLAN:-doinow-plan-back}"
+          az appservice plan show -g "$RG" -n "$PLAN" \
+          || az appservice plan create -g "$RG" -n "$PLAN" --is-linux --sku B1 --location "$LOCATION"
+          echo "APP_SERVICE_PLAN=$PLAN" >> $GITHUB_ENV
+
+      - name: Crear/usar Web App for Containers (nombre único si no hay secret)
+        run: |
+          PLAN="$APP_SERVICE_PLAN"
+          WN="${WEBAPP_NAME}"
+          if [ -z "$WN" ]; then
+            WN="doinow-back-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          WN=$(echo "$WN" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+          echo "Usando WEBAPP_NAME=$WN"
+
+          if ! az webapp show -g "$RG" -n "$WN" >/dev/null 2>&1; then
+            az webapp create -g "$RG" -p "$PLAN" -n "$WN" \
+              --deployment-container-image-name "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+          fi
+
+          # Contenedor (ACR) + puerto del backend (3000) + envs
+          az webapp config container set -g "$RG" -n "$WN" \
+            --docker-custom-image-name "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" \
+            --docker-registry-server-url "https://$ACR_LOGIN_SERVER" \
+            --docker-registry-server-user "${{ secrets.ACR_USERNAME }}" \
+            --docker-registry-server-password "${{ secrets.ACR_PASSWORD }}"
+
+          az webapp config appsettings set -g "$RG" -n "$WN" \
+            --settings WEBSITES_PORT=3000 \
+                      NODE_ENV=production \
+                      MONGO_URI="$MONGO_URI" \
+                      JWT_SECRET="$JWT_SECRET" \
+                      MAIL_USER="$MAIL_USER" \
+                      MAIL_PASS="$MAIL_PASS" \
+                      FRONTEND_ORIGIN="${FRONTEND_ORIGIN}"
+
+          echo "WEBAPP_NAME=$WN" >> $GITHUB_ENV
+
+      - name: Reiniciar Web App
+        run: az webapp restart -g "$RG" -n "$WEBAPP_NAME"
+
+      - name: Mostrar URL HTTPS del Backend
+        run: |
+          HOST=$(az webapp show -g "$RG" -n "$WEBAPP_NAME" --query defaultHostName -o tsv)
+          echo "Backend HTTPS: https://${HOST}"
+          echo "Usa esta URL en tu frontend (.env.production => VITE_API_BASE_URL y VITE_UPLOADS_BASE_URL)"
