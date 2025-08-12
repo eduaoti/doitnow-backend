@@ -24,6 +24,7 @@ const usuariosRoutes = require('./routes/usuarios.routes');
 
 // --- App / Env ---
 const app = express();
+app.set('trust proxy', true); // ✅ para IP real detrás del proxy de Azure
 const PORT = Number(process.env.PORT) || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PROD = NODE_ENV === 'production';
@@ -49,8 +50,8 @@ app.use(cors({
 // (Opcional) Log de requests para ver tráfico en App Service
 try {
   const morgan = require('morgan');
-  // Si tienes auth, puedes exponer un id: morgan.token('uid', req => req.user?.id || '-');
-  app.use(morgan('combined')); // o ':method :url :status :response-time ms'
+  // ✅ fecha ISO | IP | MÉTODO | URL | STATUS | bytes | tiempo
+  app.use(morgan(':date[iso] :remote-addr :method :url :status :res[content-length] - :response-time ms'));
 } catch (_) { /* morgan no instalado, no pasa nada */ }
 
 // --- Middlewares base ---
